@@ -1,8 +1,7 @@
-import tweepy
 import os
+import tweepy
 
 def get_lineup():
-    # Replace with real data or web scrape later
     return (
         "🔵 Chelsea Starting XI vs Arsenal:\n"
         "Petrovic, Gusto, Disasi, Silva, Cucurella\n"
@@ -12,18 +11,18 @@ def get_lineup():
     )
 
 def tweet_lineup():
-    # Get credentials from environment variables
-    api_key = os.getenv("API_KEY")
-    api_secret = os.getenv("API_SECRET")
-    access_token = os.getenv("ACCESS_TOKEN")
-    access_secret = os.getenv("ACCESS_SECRET")
+    bearer_token = os.getenv("BEARER_TOKEN")
 
-    auth = tweepy.OAuth1UserHandler(api_key, api_secret, access_token, access_secret)
-    api = tweepy.API(auth)
+    client = tweepy.Client(
+        bearer_token=bearer_token,
+        consumer_key=os.getenv("API_KEY"),
+        consumer_secret=os.getenv("API_SECRET"),
+        access_token=os.getenv("ACCESS_TOKEN"),
+        access_token_secret=os.getenv("ACCESS_SECRET")
+    )
 
-    lineup = get_lineup()
-    api.update_status(lineup)
-    print("✅ Tweet posted!")
+    response = client.create_tweet(text=get_lineup())
+    print("✅ Tweeted:", response)
 
 if __name__ == "__main__":
     tweet_lineup()
