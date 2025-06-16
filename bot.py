@@ -28,8 +28,17 @@ def load_state():
             "subs_posted": [],
             "final_score_posted": False
         }
-    with open(STATE_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {
+            "match_id": None,
+            "lineup_posted": False,
+            "goals_posted": [],
+            "subs_posted": [],
+            "final_score_posted": False
+        }
 
 
 def save_state(state):
@@ -38,85 +47,207 @@ def save_state(state):
 
 
 def get_today_match():
-    statuses = ["SCHEDULED", "TIMED", "IN_PLAY", "PAUSED", "FINISHED"]
+    """Get Chelsea match for today from all competitions"""
     today = datetime.now(timezone.utc).date()
-
-    for status in statuses:
-        url = f"https://api.football-data.org/v4/teams/{TEAM_ID}/matches?status={status}"
-        res = requests.get(url, headers=headers).json()
-        for match in res.get("matches", []):
-            match_date = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00")).date()
-            if match_date == today:
-                return match
-    return None
+    
+    # Get matches for today and tomorrow (timezone buffer)
+    tomorrow = datetime.now(timezone.utc).date().replace(day=today.day + 1) if today.day < 28 else today
+    url = f"https://api.football-data.org/v4/teams/{TEAM_ID}/matches"
+    params = {
+        'dateFrom': today.isoformat(),
+        'dateTo': tomorrow.isoformat()  # Include tomorrow for timezone safety
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        print(f"API Response: {data}")  # Debug logging
+        
+        matches = data.get("matches", [])
+        if matches:
+            # Return the first match found for today
+            match = matches[0]
+            print(f"Found match: {match['homeTeam']['name']} vs {match['awayTeam']['name']} at {match['utcDate']}")
+            return match
+        else:
+            print(f"No matches found for today ({today})")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching matches: {e}")
+        return None
 
 
 def get_match_details(match_id):
+    """Get detailed match information including lineups and events"""
     url = f"https://api.football-data.org/v4/matches/{match_id}"
-    return requests.get(url, headers=headers).json()
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        print(f"Match details status: {data.get('status', 'Unknown')}")
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching match details: {e}")
+        return None
 
 
 def post_lineup(match_details, state):
-    lineup_data = match_details.get("match", {}).get("lineups", [])
-    lineup = next((l for l in lineup_data if l["team"]["id"] == TEAM_ID), None)
-
-    if lineup and not state["lineup_posted"]:
-        names = [p["name"] for p in lineup.get("startXI", [])]
-        tweet = "🔵 Chelsea Starting XI:\n" + "\n".join(names)
-        api.update_status(tweet)
-        print("✅ Lineup tweeted.")
-        state["lineup_posted"] = True
+    """Post starting lineup when available"""
+    if not match_details or state["lineup_posted"]:
+        return
+        
+    # Check if lineups are available
+    lineups = match_details.get("lineups", [])
+    if not lineups:
+        print("No lineups available yet")
+        return
+    
+    # Find Chelsea's lineup
+    chelsea_lineup = None
+    for lineup in lineups:
+        if lineup["team"]["id"] == TEAM_ID:
+            chelsea_lineup = lineup
+            break
+    
+    if chelsea_lineup and chelsea_lineup.get("startXI"):
+        try:
+            players = [player["name"] for player in chelsea_lineup["startXI"]]
+            formation = chelsea_lineup.get("formation", "Unknown")
+            
+            tweet = f"🔵 Chelsea Starting XI ({formation}):\n\n" + "\n".join([f"• {player}" for player in players])
+            
+            if len(tweet) > 280:  # Twitter character limit
+                tweet = f"🔵 Chelsea Starting XI:\n\n" + "\n".join([f"• {player}" for player in players[:11]])
+            
+            api.update_status(tweet)
+            print("✅ Lineup tweeted.")
+            state["lineup_posted"] = True
+        except Exception as e:
+            print(f"Error posting lineup: {e}")
 
 
 def post_goals(match_details, state):
-    goals = [e for e in match_details["match"].get("events", []) if e["type"] == "GOAL"]
+    """Post goals as they happen"""
+    if not match_details:
+        return
+        
+    # Get all goal events
+    events = match_details.get("events", [])
+    goals = [e for e in events if e.get("type") == "GOAL"]
+    
     for goal in goals:
-        if goal["id"] not in state["goals_posted"]:
-            team = goal["team"]["name"]
-            scorer = goal["player"]["name"]
-            minute = goal["minute"]
-            tweet = f"⚽ {team} Goal!\n{scorer} ({minute}’)"
-            api.update_status(tweet)
-            print("✅ Goal tweeted.")
-            state["goals_posted"].append(goal["id"])
+        goal_id = goal.get("id")
+        if goal_id and goal_id not in state["goals_posted"]:
+            try:
+                team_name = goal["team"]["name"]
+                scorer = goal["player"]["name"]
+                minute = goal.get("minute", "?")
+                
+                # Check if it's Chelsea or opponent
+                emoji = "⚽️🔵" if goal["team"]["id"] == TEAM_ID else "⚽️"
+                
+                tweet = f"{emoji} GOAL!\n{team_name}: {scorer} ({minute}')"
+                
+                api.update_status(tweet)
+                print(f"✅ Goal tweeted: {scorer}")
+                state["goals_posted"].append(goal_id)
+            except Exception as e:
+                print(f"Error posting goal: {e}")
 
 
 def post_subs(match_details, state):
-    subs = [e for e in match_details["match"].get("events", []) if e["type"] == "SUBSTITUTION"]
+    """Post substitutions"""
+    if not match_details:
+        return
+        
+    events = match_details.get("events", [])
+    subs = [e for e in events if e.get("type") == "SUBSTITUTION"]
+    
     for sub in subs:
-        if sub["id"] not in state["subs_posted"]:
-            team = sub["team"]["name"]
-            in_player = sub["player"]["name"]
-            out_player = sub["assist"]["name"]
-            minute = sub["minute"]
-            tweet = f"🔁 Substitution for {team}:\n⬅ {out_player}\n➡ {in_player} ({minute}’)"
-            api.update_status(tweet)
-            print("✅ Sub tweeted.")
-            state["subs_posted"].append(sub["id"])
+        sub_id = sub.get("id")
+        if sub_id and sub_id not in state["subs_posted"]:
+            try:
+                # Only post Chelsea substitutions
+                if sub["team"]["id"] == TEAM_ID:
+                    player_in = sub["player"]["name"]
+                    player_out = sub.get("assist", {}).get("name", "Unknown")
+                    minute = sub.get("minute", "?")
+                    
+                    tweet = f"🔁 Chelsea Substitution ({minute}'):\n⬅️ {player_out}\n➡️ {player_in}"
+                    
+                    api.update_status(tweet)
+                    print(f"✅ Substitution tweeted: {player_in} for {player_out}")
+                
+                state["subs_posted"].append(sub_id)
+            except Exception as e:
+                print(f"Error posting substitution: {e}")
 
 
 def post_final_score(match_details, state):
-    if not state["final_score_posted"] and match_details["match"]["status"] == "FINISHED":
-        score = match_details["match"]["score"]["fullTime"]
-        home = match_details["match"]["homeTeam"]["name"]
-        away = match_details["match"]["awayTeam"]["name"]
-        tweet = f"📊 Full Time:\n{home} {score['home']} - {score['away']} {away}"
-        api.update_status(tweet)
-        print("✅ Final score tweeted.")
-        state["final_score_posted"] = True
+    """Post final score when match is finished"""
+    if not match_details or state["final_score_posted"]:
+        return
+        
+    if match_details.get("status") == "FINISHED":
+        try:
+            score = match_details.get("score", {}).get("fullTime", {})
+            home_team = match_details["homeTeam"]["name"]
+            away_team = match_details["awayTeam"]["name"]
+            home_score = score.get("home", 0)
+            away_score = score.get("away", 0)
+            
+            # Determine result for Chelsea
+            if match_details["homeTeam"]["id"] == TEAM_ID:
+                chelsea_score = home_score
+                opponent_score = away_score
+                opponent = away_team
+            else:
+                chelsea_score = away_score
+                opponent_score = home_score
+                opponent = home_team
+            
+            if chelsea_score > opponent_score:
+                result_emoji = "🎉✅"
+            elif chelsea_score < opponent_score:
+                result_emoji = "😞❌"
+            else:
+                result_emoji = "🤝"
+            
+            tweet = f"{result_emoji} FULL TIME\n\n{home_team} {home_score} - {away_score} {away_team}\n\n#CFC #Chelsea"
+            
+            api.update_status(tweet)
+            print("✅ Final score tweeted.")
+            state["final_score_posted"] = True
+        except Exception as e:
+            print(f"Error posting final score: {e}")
 
 
 def main():
+    print(f"🤖 Chelsea Bot running at {datetime.now(timezone.utc)}")
+    
+    # Load previous state
     state = load_state()
+    
+    # Get today's match
     match = get_today_match()
-
+    
     if not match:
         print("📅 No Chelsea match today.")
         return
-
+    
     match_id = match["id"]
-
+    match_status = match.get("status", "Unknown")
+    
+    print(f"📊 Match found: {match['homeTeam']['name']} vs {match['awayTeam']['name']}")
+    print(f"📊 Match status: {match_status}")
+    print(f"📊 Match time: {match['utcDate']}")
+    
+    # Reset state if this is a new match
     if state["match_id"] != match_id:
+        print("🔄 New match detected, resetting state")
         state = {
             "match_id": match_id,
             "lineup_posted": False,
@@ -124,14 +255,30 @@ def main():
             "subs_posted": [],
             "final_score_posted": False
         }
-
+    
+    # Get detailed match information
     match_details = get_match_details(match_id)
-    post_lineup(match_details, state)
-    post_goals(match_details, state)
-    post_subs(match_details, state)
-    post_final_score(match_details, state)
-
+    
+    if not match_details:
+        print("❌ Could not fetch match details")
+        return
+    
+    # Post updates based on match status
+    # Try to post lineup even for SCHEDULED matches (in case lineups are available early)
+    if match_status in ["SCHEDULED", "TIMED", "IN_PLAY", "PAUSED", "FINISHED"]:
+        post_lineup(match_details, state)
+    
+    # Only post live updates for active/finished matches
+    if match_status in ["IN_PLAY", "PAUSED", "FINISHED"]:
+        post_goals(match_details, state)
+        post_subs(match_details, state)
+    
+    if match_status == "FINISHED":
+        post_final_score(match_details, state)
+    
+    # Save state
     save_state(state)
+    print("✅ Bot execution completed")
 
 
 if __name__ == "__main__":
